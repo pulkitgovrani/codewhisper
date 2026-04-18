@@ -14,6 +14,33 @@ let stderrBuf = "";
 
 const PYTHON_TIMEOUT_MS = 120_000;
 
+function speechMicErrorHint(code: string | undefined): string {
+  const c = (code ?? "").toLowerCase();
+  if (c === "not-allowed" || c === "service-not-allowed") {
+    if (process.platform === "darwin") {
+      return (
+        "Microphone blocked (not-allowed). On macOS: System Settings → Privacy & Security → Microphone → " +
+        "turn ON for Visual Studio Code or Cursor. Then Developer: Reload Window and open Voice Ask again."
+      );
+    }
+    if (process.platform === "win32") {
+      return (
+        "Microphone blocked (not-allowed). Windows: Settings → Privacy & security → Microphone → allow access, " +
+        "and allow VS Code. Then reload the window and try again."
+      );
+    }
+    return (
+      "Microphone blocked (not-allowed). Allow the microphone for this app in your OS privacy settings, reload the window, and try again."
+    );
+  }
+  return `Speech recognition: ${code ?? "unknown error"}`;
+}
+
+/** Trim secrets so pasted keys with newlines/spaces still work. */
+function trimSecret(value: string | undefined): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function defaultPythonExecutable(): string {
   return process.platform === "win32" ? "python" : "python3";
 }
@@ -172,49 +199,100 @@ function getVoiceHtml(): string {
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob: data:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob: data: mediastream:;">
   <style>
-    body { font-family: var(--vscode-font-family); background: var(--vscode-editor-background); color: var(--vscode-foreground); display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0; gap:16px; }
+    body { font-family: var(--vscode-font-family); background: var(--vscode-editor-background); color: var(--vscode-foreground); display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0; gap:12px; padding:12px; box-sizing:border-box; }
     button { font-size:48px; background:none; border:none; cursor:pointer; }
-    #status { font-size:14px; opacity:0.7; }
+    #status { font-size:13px; opacity:0.85; text-align:center; max-width:28rem; line-height:1.4; }
     audio { display:none; }
+    .row { width:100%; max-width:28rem; display:flex; flex-direction:column; gap:8px; }
+    #textq { width:100%; min-height:4.5rem; resize:vertical; box-sizing:border-box; padding:8px; font-family: inherit; font-size:13px;
+      color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, #555); border-radius:4px; }
+    #askbtn { font-size:13px; padding:8px 14px; cursor:pointer; align-self:flex-start;
+      color: var(--vscode-button-foreground); background: var(--vscode-button-background); border:none; border-radius:4px; }
+    #askbtn:hover { background: var(--vscode-button-hoverBackground); }
+    .hint { font-size:11px; opacity:0.65; max-width:28rem; }
   </style>
 </head>
 <body>
-  <button id="btn">🎙</button>
-  <div id="status">Tap to speak</div>
+  <button id="btn" title="Voice">🎙</button>
+  <div id="status">Tap the mic to speak, or type a question below (no microphone needed).</div>
   <audio id="player"></audio>
+  <div class="row">
+    <textarea id="textq" placeholder="Type your question for the model…" rows="3"></textarea>
+    <button type="button" id="askbtn">Ask with text</button>
+  </div>
+  <div class="hint">If macOS never shows a mic toggle for this app, use <strong>Ask with text</strong> to test Groq and ElevenLabs.</div>
   <script>
     const vscode = acquireVsCodeApi();
     const btn = document.getElementById('btn');
     const status = document.getElementById('status');
     const player = document.getElementById('player');
+    const textq = document.getElementById('textq');
+    const askbtn = document.getElementById('askbtn');
 
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { status.textContent = 'Speech API not supported'; }
+    if (!SR) { status.textContent = 'Speech API not supported in this webview — use “Ask with text” below.'; }
 
     let rec;
 
-    btn.addEventListener('click', () => {
+    askbtn.addEventListener('click', () => {
+      const text = (textq && textq.value || '').trim();
+      if (!text) { status.textContent = 'Type a question first.'; return; }
+      status.textContent = 'Sending…';
+      vscode.postMessage({ type: 'transcript', text });
+    });
+
+    textq.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        askbtn.click();
+      }
+    });
+
+    btn.addEventListener('click', async () => {
       if (!SR) return;
+      status.textContent = 'Requesting microphone (system prompt may appear)…';
+      btn.disabled = true;
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach(function (t) { t.stop(); });
+        } catch (err) {
+          var en = err && err.name ? err.name : 'Error';
+          status.textContent =
+            'Microphone blocked (' + en + '). Use “Ask with text” below. On macOS: System Settings → Privacy & Security → Microphone → enable this editor app, then reload the window.';
+          btn.textContent = '🎙';
+          btn.disabled = false;
+          vscode.postMessage({ type: 'error', message: en === 'NotAllowedError' ? 'not-allowed' : en });
+          return;
+        }
+      }
       rec = new SR();
       rec.continuous = false;
       rec.interimResults = false;
       rec.lang = 'en-US';
-      rec.onstart = () => { status.textContent = 'Listening…'; btn.textContent = '🔴'; };
-      rec.onresult = (e) => {
-        const text = e.results[0][0].transcript;
+      rec.onstart = function () { status.textContent = 'Listening…'; btn.textContent = '🔴'; };
+      rec.onresult = function (e) {
+        var text = e.results[0][0].transcript;
         status.textContent = 'Got it!';
         btn.textContent = '🎙';
-        vscode.postMessage({ type: 'transcript', text });
+        btn.disabled = false;
+        vscode.postMessage({ type: 'transcript', text: text });
       };
-      rec.onerror = (e) => {
-        status.textContent = 'Error: ' + e.error;
+      rec.onerror = function (e) {
+        status.textContent = 'Speech: ' + e.error + ' — use “Ask with text” below if this persists.';
         btn.textContent = '🎙';
+        btn.disabled = false;
         vscode.postMessage({ type: 'error', message: e.error });
       };
-      rec.onend = () => { btn.textContent = '🎙'; };
-      rec.start();
+      rec.onend = function () { btn.textContent = '🎙'; btn.disabled = false; };
+      try {
+        rec.start();
+      } catch (e) {
+        status.textContent = 'Could not start speech recognition. Use “Ask with text” below.';
+        btn.disabled = false;
+      }
     });
 
     window.addEventListener('message', (e) => {
@@ -223,10 +301,15 @@ function getVoiceHtml(): string {
         status.textContent = 'Playing…';
         player.src = 'data:audio/mpeg;base64,' + m.data;
         player.play().catch(() => {});
-        player.onended = () => { status.textContent = 'Done. Tap to speak again.'; };
+        player.onended = () => { status.textContent = 'Done. Mic or text again.'; };
       }
       if (m.type === 'thinking') { status.textContent = 'Thinking…'; }
-      if (m.type === 'error') { status.textContent = 'Error: ' + m.message; }
+      if (m.type === 'error') {
+        var em = m.message || '';
+        status.textContent = (em === 'not-allowed' || em === 'NotAllowedError')
+          ? 'Microphone denied — use “Ask with text” below.'
+          : ('Error: ' + em);
+      }
     });
   </script>
 </body>
@@ -252,15 +335,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     panel.webview.onDidReceiveMessage(async (msg: { type: string; text?: string; message?: string }) => {
       if (msg.type === "error") {
         status.text = "$(mic) CodeWhisper";
-        void vscode.window.showWarningMessage(`CodeWhisper mic error: ${msg.message}`);
+        void vscode.window.showWarningMessage(`CodeWhisper — ${speechMicErrorHint(msg.message)}`);
         return;
       }
       if (msg.type !== "transcript" || !msg.text) return;
 
       const cfg = vscode.workspace.getConfiguration("codewhisper");
-      const groqKey = cfg.get<string>("groqApiKey") ?? "";
-      const elKey = cfg.get<string>("elevenLabsApiKey") ?? "";
-      const voiceId = cfg.get<string>("elevenLabsVoiceId") ?? "";
+      const groqKey = trimSecret(cfg.get<string>("groqApiKey"));
+      const elKey = trimSecret(cfg.get<string>("elevenLabsApiKey"));
+      const voiceId = trimSecret(cfg.get<string>("elevenLabsVoiceId"));
       const { code, filename } = getEditorContext();
 
       if (!groqKey) {
@@ -322,9 +405,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const voiceAsk = vscode.commands.registerCommand("codewhisper.voiceAsk", async () => {
     const cfg = vscode.workspace.getConfiguration("codewhisper");
-    const groqKey = cfg.get<string>("groqApiKey") ?? "";
-    const elKey = cfg.get<string>("elevenLabsApiKey") ?? "";
-    const voiceId = cfg.get<string>("elevenLabsVoiceId") ?? "";
+    const groqKey = trimSecret(cfg.get<string>("groqApiKey"));
+    const elKey = trimSecret(cfg.get<string>("elevenLabsApiKey"));
+    const voiceId = trimSecret(cfg.get<string>("elevenLabsVoiceId"));
 
     if (!groqKey) {
       void vscode.window.showErrorMessage("CodeWhisper: set codewhisper.groqApiKey in settings.");

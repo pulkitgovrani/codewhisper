@@ -13,12 +13,12 @@ def handle(msg: dict) -> dict:
     if msg.get("type") != "ask":
         return {"type": "error", "message": f"Unknown message type: {msg.get('type')}"}
 
-    transcript = msg.get("transcript", "")
-    code = msg.get("code", "")
-    filename = msg.get("filename", "")
-    groq_api_key = msg.get("groq_api_key", "")
-    el_api_key = msg.get("elevenlabs_api_key", "")
-    voice_id = msg.get("voice_id", "")
+    transcript = str(msg.get("transcript", "")).strip()
+    code = str(msg.get("code", ""))
+    filename = str(msg.get("filename", ""))
+    groq_api_key = str(msg.get("groq_api_key", "")).strip()
+    el_api_key = str(msg.get("elevenlabs_api_key", "")).strip()
+    voice_id = str(msg.get("voice_id", "")).strip()
 
     if not groq_api_key:
         return {"type": "error", "message": "groqApiKey is not set."}

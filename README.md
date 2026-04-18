@@ -1,5 +1,7 @@
 # CodeWhisper (VS Code)
 
+In the Extensions sidebar and Marketplace, this extension is shown as **CodeWhisper** (`displayName` in `package.json`). The shorter field `name` is only the technical id (`codewhisperer.codewhisper-voice`); it does not replace that title.
+
 Ask questions **by voice** about the code in your active editor. The extension sends your speech transcript plus the **current file or selection** to **Groq**, then plays the answer with **ElevenLabs** text-to-speech.
 
 **Not affiliated with Amazon Web Services or AWS CodeWhisperer.** This is an independent open-source extension.
@@ -48,13 +50,40 @@ If you use a non-default interpreter, set **CodeWhisper › Python Path** in Set
 1. Configure the three API-related settings above.
 2. Open a file and focus the editor.
 3. Run **CodeWhisper: Voice Ask** from the Command Palette, click the **CodeWhisper** status bar item, or use **Cmd+Shift+Space** (macOS) / **Ctrl+Shift+Space** (Windows/Linux) when the editor is focused.
-4. In the side panel, tap the microphone and speak (uses the browser **Web Speech API** inside the webview).
+4. In the side panel, either **tap the microphone** and speak (Web Speech API), or **type a question** and click **Ask with text** (same pipeline, no microphone).
 
 If nothing is selected, **the whole file** is sent as context (truncated on the server side). With a selection, only the selection is sent.
 
 ## Speech recognition limitations
 
 Recognition runs in an embedded webview (Chromium). Availability and quality depend on **OS**, **VS Code version**, and **network** (where the engine requires it). If you see “Speech API not supported”, use a different environment or keyboard input (future versions may add alternatives).
+
+### “Mic error: not-allowed”
+
+That means the **OS denied the microphone** to the editor process (not your Groq/Eleven keys).
+
+- **macOS:** **System Settings → Privacy & Security → Microphone** — enable **Visual Studio Code** and/or **Cursor** (whichever you use). If it was off, turn it on, then in VS Code run **Developer: Reload Window** and try Voice Ask again.
+- **Windows:** **Settings → Privacy & security → Microphone** — allow microphone access and allow **Visual Studio Code** for desktop apps.
+- **Linux:** varies by distro; allow the browser/Electron app to use the mic (PipeWire/PulseAudio, Flatpak portal, etc.).
+
+If you previously clicked **Don’t allow**, reset the choice in the same privacy screen or remove/re-add the app from the list where applicable.
+
+**macOS never shows VS Code / Cursor under Microphone**
+
+- The list often **only fills after** the app has tried to use the mic. Try Voice Ask → mic once, then reopen **System Settings → Privacy & Security → Microphone** and scroll the full list (VS Code and Cursor are separate entries).
+- **Cursor** and **Visual Studio Code** are different apps — enable the one you actually launch.
+- Some Electron builds still never trigger the system prompt from a webview; use **Ask with text** in the CodeWhisper panel to verify Groq + ElevenLabs anyway.
+- To reset only VS Code’s mic decision (Terminal):  
+  `tccutil reset Microphone com.microsoft.VSCode`  
+  Then restart VS Code and try the mic again (you may need to approve once). For **Cursor**, get its bundle id with `osascript -e 'id of app "Cursor"'` and run `tccutil reset Microphone <that-id>` the same way.
+
+### ElevenLabs `401 Unauthorized`
+
+That means ElevenLabs **rejected your API key** (wrong, expired, or copied with extra characters).
+
+1. In [ElevenLabs](https://elevenlabs.io), open **API keys** (from your profile / developer settings) and copy the key used for HTTP requests (`xi-api-key`).
+2. In VS Code: **Settings** → **Codewhisper: Elevenlabs Api Key** — paste only the key (no `Bearer` prefix, no quotes). The extension **trims** leading/trailing spaces (v1.0.2+).
+3. **Developer: Reload Window** and try **Ask with text** again. The voice ID must belong to the **same** ElevenLabs account as that key.
 
 ## Privacy
 
@@ -82,4 +111,6 @@ From the `codewhisper` folder, use a clean `out/` so old builds are not bundled:
 rm -rf out && npm install && npm run compile && npx @vscode/vsce package
 ```
 
-This produces `codewhisper-1.0.0.vsix` (version follows `package.json`).
+This produces `codewhisper-voice-<version>.vsix` (from the `name` and `version` fields in `package.json`).
+
+**Mic troubleshooting:** the panel first calls **`getUserMedia`** so macOS can show a real microphone prompt; only then it starts Web Speech. If you still see `not-allowed`, use **Ask with text** or enable the app under **System Settings → Privacy & Security → Microphone** and **Developer: Reload Window**.

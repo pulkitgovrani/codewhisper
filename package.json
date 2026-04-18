@@ -1,8 +1,8 @@
 {
-  "name": "codewhisper",
+  "name": "codewhisper-voice",
   "displayName": "CodeWhisper",
   "description": "Voice Ask for your editor: speak a question, send context from the file to Groq, hear the answer with ElevenLabs.",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "publisher": "codewhisperer",
   "repository": {
     "type": "git",
