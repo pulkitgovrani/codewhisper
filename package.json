@@ -1,0 +1,123 @@
+{
+  "name": "codewhisper",
+  "displayName": "CodeWhisper",
+  "description": "Explain selected code with AI and hear it via ElevenLabs.",
+  "version": "0.1.0",
+  "publisher": "codewhisper",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codewhisper.explainSelection",
+        "title": "CodeWhisper: Explain Selection"
+      },
+      {
+        "command": "codewhisper.stopSpeaking",
+        "title": "CodeWhisper: Stop Speaking"
+      },
+      {
+        "command": "codewhisper.setLlmApiKey",
+        "title": "CodeWhisper: Set LLM API Key"
+      },
+      {
+        "command": "codewhisper.setElevenLabsApiKey",
+        "title": "CodeWhisper: Set ElevenLabs API Key"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codewhisper.explainSelection",
+        "key": "ctrl+alt+g",
+        "mac": "cmd+alt+g",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codewhisper.explainSelection",
+          "when": "editorTextFocus",
+          "group": "navigation@100"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodeWhisper",
+      "properties": {
+        "codewhisper.llmBaseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "OpenAI-compatible API base URL (no trailing slash)."
+        },
+        "codewhisper.llmModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Chat model id for explanations."
+        },
+        "codewhisper.llmTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 5000
+        },
+        "codewhisper.detailLevel": {
+          "type": "string",
+          "enum": [
+            "brief",
+            "standard",
+            "deep"
+          ],
+          "default": "standard",
+          "description": "How much is spoken: brief (summary), standard (+ complexity), deep (+ suggestions)."
+        },
+        "codewhisper.maxSelectionChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 1000
+        },
+        "codewhisper.maxContextLinesWhenNoSelection": {
+          "type": "number",
+          "default": 80,
+          "minimum": 10
+        },
+        "codewhisper.elevenlabsVoiceId": {
+          "type": "string",
+          "default": "",
+          "description": "ElevenLabs voice id (from their dashboard)."
+        },
+        "codewhisper.elevenlabsTtsModel": {
+          "type": "string",
+          "default": "eleven_turbo_v2_5",
+          "description": "ElevenLabs model_id for TTS."
+        },
+        "codewhisper.audioFallback": {
+          "type": "string",
+          "enum": [
+            "none",
+            "local"
+          ],
+          "default": "none",
+          "description": "local = macOS say when ElevenLabs is unavailable (dev only)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
