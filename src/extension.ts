@@ -2,14 +2,63 @@ import * as vscode from "vscode";
 import * as cp from "child_process";
 import * as path from "path";
 import * as readline from "readline";
+import { promisify } from "util";
+
+const execFileAsync = promisify(cp.execFile);
 
 let pyProc: cp.ChildProcess | undefined;
 let rl: readline.Interface | undefined;
 let pendingResolve: ((msg: Record<string, unknown>) => void) | undefined;
+let suppressPythonExitLog = false;
+let stderrBuf = "";
 
-function spawnPython(extPath: string): void {
+const PYTHON_TIMEOUT_MS = 120_000;
+
+function defaultPythonExecutable(): string {
+  return process.platform === "win32" ? "python" : "python3";
+}
+
+function pythonExecutable(): string {
+  const cfg = vscode.workspace.getConfiguration("codewhisper");
+  const override = cfg.get<string>("pythonPath")?.trim();
+  return override && override.length > 0 ? override : defaultPythonExecutable();
+}
+
+function backendDir(extPath: string): string {
+  return path.join(extPath, "backend");
+}
+
+function pipInstallCommand(extPath: string): string {
+  const req = path.join(backendDir(extPath), "requirements.txt");
+  const py = pythonExecutable();
+  return `${py} -m pip install --user -r "${req}"`;
+}
+
+async function runPipInstallDeps(extPath: string): Promise<void> {
+  const py = pythonExecutable();
+  const req = path.join(backendDir(extPath), "requirements.txt");
+  await execFileAsync(py, ["-m", "pip", "install", "--user", "-r", req], {
+    windowsHide: true,
+  });
+}
+
+function disposePython(): void {
+  suppressPythonExitLog = true;
+  rl?.close();
+  rl = undefined;
+  pyProc?.removeAllListeners();
+  pyProc?.kill();
+  pyProc = undefined;
+}
+
+function spawnPython(extPath: string, output: vscode.OutputChannel): void {
+  disposePython();
+  suppressPythonExitLog = false;
+  stderrBuf = "";
   const script = path.join(extPath, "backend", "main.py");
-  pyProc = cp.spawn("python3", [script], { stdio: ["pipe", "pipe", "pipe"] });
+  const py = pythonExecutable();
+  pyProc = cp.spawn(py, [script], { stdio: ["pipe", "pipe", "pipe"] });
+
   rl = readline.createInterface({ input: pyProc.stdout! });
   rl.on("line", (line) => {
     try {
@@ -20,16 +69,91 @@ function spawnPython(extPath: string): void {
       // ignore malformed lines
     }
   });
+
   pyProc.stderr!.on("data", (d: Buffer) => {
-    console.error("[codewhisper python]", d.toString());
+    const s = d.toString();
+    stderrBuf += s;
+    output.appendLine(s.trimEnd());
+  });
+
+  pyProc.on("error", (err: NodeJS.ErrnoException) => {
+    void vscode.window.showErrorMessage(
+      `CodeWhisper: could not start Python (${py}). ${err.message}. Check Settings → CodeWhisper → Python Path.`
+    );
+  });
+
+  pyProc.on("exit", (code, signal) => {
+    if (suppressPythonExitLog) {
+      suppressPythonExitLog = false;
+      return;
+    }
+    const hint = stderrBuf.includes("ModuleNotFoundError")
+      ? `Try: ${pipInstallCommand(extPath)}`
+      : "";
+    output.appendLine(
+      `Python backend exited (${signal ?? `code ${code}`}). ${hint}`.trim()
+    );
+    pyProc = undefined;
+    rl?.close();
+    rl = undefined;
   });
 }
 
-function sendToPython(msg: Record<string, unknown>): Promise<Record<string, unknown>> {
+function sendToPython(msg: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
-    pendingResolve = resolve;
-    pyProc?.stdin?.write(JSON.stringify(msg) + "\n");
+    if (!pyProc?.stdin?.writable) {
+      resolve({ type: "error", message: "Python backend is not running." });
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingResolve = undefined;
+      resolve({ type: "error", message: "Request timed out. Check network and API keys." });
+    }, timeoutMs);
+    pendingResolve = (response: Record<string, unknown>) => {
+      clearTimeout(timer);
+      resolve(response);
+    };
+    try {
+      pyProc.stdin.write(JSON.stringify(msg) + "\n");
+    } catch {
+      clearTimeout(timer);
+      pendingResolve = undefined;
+      resolve({ type: "error", message: "Failed to write to Python backend." });
+    }
   });
+}
+
+async function ensureBackendAlive(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<boolean> {
+  if (pyProc && !pyProc.killed) return true;
+  spawnPython(context.extensionPath, output);
+  await new Promise((r) => setTimeout(r, 150));
+  if (!pyProc || pyProc.killed) return false;
+  const pong = await sendToPython({ type: "ping" }, 8000);
+  return pong.type === "pong";
+}
+
+async function offerInstallDeps(extPath: string): Promise<void> {
+  const cmd = pipInstallCommand(extPath);
+  const choice = await vscode.window.showWarningMessage(
+    "CodeWhisper: Python package httpx (or backend) is missing.",
+    "Install now",
+    "Copy pip command"
+  );
+  if (choice === "Copy pip command") {
+    await vscode.env.clipboard.writeText(cmd);
+    void vscode.window.showInformationMessage("Copied pip command to clipboard.");
+  } else if (choice === "Install now") {
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "CodeWhisper: installing Python dependencies…" },
+        () => runPipInstallDeps(extPath)
+      );
+      void vscode.window.showInformationMessage("CodeWhisper: Python dependencies installed. Run Voice Ask again.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      void vscode.window.showErrorMessage(`CodeWhisper: pip install failed. ${msg}`);
+    }
+  }
 }
 
 function getEditorContext(): { code: string; filename: string } {
@@ -110,15 +234,91 @@ function getVoiceHtml(): string {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  spawnPython(context.extensionPath);
+  const output = vscode.window.createOutputChannel("CodeWhisper");
+  context.subscriptions.push(output);
+
+  spawnPython(context.extensionPath, output);
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  status.text = "● ready";
-  status.tooltip = "CodeWhisper — Cmd+Shift+Space to speak";
+  status.text = "$(mic) CodeWhisper";
+  status.tooltip = "CodeWhisper — Voice Ask (Cmd+Shift+Space when editor focused)";
+  status.command = "codewhisper.voiceAsk";
   status.show();
   context.subscriptions.push(status);
 
   let voicePanel: vscode.WebviewPanel | undefined;
+
+  function attachVoicePanelHandlers(panel: vscode.WebviewPanel): void {
+    panel.webview.onDidReceiveMessage(async (msg: { type: string; text?: string; message?: string }) => {
+      if (msg.type === "error") {
+        status.text = "$(mic) CodeWhisper";
+        void vscode.window.showWarningMessage(`CodeWhisper mic error: ${msg.message}`);
+        return;
+      }
+      if (msg.type !== "transcript" || !msg.text) return;
+
+      const cfg = vscode.workspace.getConfiguration("codewhisper");
+      const groqKey = cfg.get<string>("groqApiKey") ?? "";
+      const elKey = cfg.get<string>("elevenLabsApiKey") ?? "";
+      const voiceId = cfg.get<string>("elevenLabsVoiceId") ?? "";
+      const { code, filename } = getEditorContext();
+
+      if (!groqKey) {
+        void vscode.window.showErrorMessage("CodeWhisper: set codewhisper.groqApiKey in settings.");
+        return;
+      }
+      if (!elKey || !voiceId) {
+        void vscode.window.showErrorMessage(
+          "CodeWhisper: set codewhisper.elevenLabsApiKey and codewhisper.elevenLabsVoiceId in settings."
+        );
+        return;
+      }
+
+      const alive = await ensureBackendAlive(context, output);
+      if (!alive) {
+        status.text = "$(mic) CodeWhisper";
+        void panel.webview.postMessage({ type: "error", message: "Python backend not ready." });
+        await offerInstallDeps(context.extensionPath);
+        spawnPython(context.extensionPath, output);
+        return;
+      }
+
+      status.text = "$(loading~spin) CodeWhisper";
+      void panel.webview.postMessage({ type: "thinking" });
+
+      const response = await sendToPython(
+        {
+          type: "ask",
+          transcript: msg.text,
+          code,
+          filename,
+          groq_api_key: groqKey,
+          elevenlabs_api_key: elKey,
+          voice_id: voiceId,
+        },
+        PYTHON_TIMEOUT_MS
+      );
+
+      if (response.type === "error") {
+        status.text = "$(mic) CodeWhisper";
+        const errText = String(response.message ?? "Unknown error");
+        void panel.webview.postMessage({ type: "error", message: errText });
+        void vscode.window.showErrorMessage(`CodeWhisper: ${errText}`);
+        if (errText.includes("ModuleNotFoundError") || errText.includes("No module named")) {
+          await offerInstallDeps(context.extensionPath);
+          spawnPython(context.extensionPath, output);
+        }
+        return;
+      }
+
+      status.text = "$(unmute) CodeWhisper";
+      void panel.webview.postMessage({ type: "play", data: response.audio_b64 });
+
+      setTimeout(() => {
+        status.text = "$(mic) CodeWhisper";
+      }, 15000);
+    });
+  }
 
   const voiceAsk = vscode.commands.registerCommand("codewhisper.voiceAsk", async () => {
     const cfg = vscode.workspace.getConfiguration("codewhisper");
@@ -130,8 +330,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void vscode.window.showErrorMessage("CodeWhisper: set codewhisper.groqApiKey in settings.");
       return;
     }
+    if (!elKey || !voiceId) {
+      void vscode.window.showErrorMessage(
+        "CodeWhisper: set codewhisper.elevenLabsApiKey and codewhisper.elevenLabsVoiceId in settings."
+      );
+      return;
+    }
 
-    const { code, filename } = getEditorContext();
+    const alive = await ensureBackendAlive(context, output);
+    if (!alive) {
+      await offerInstallDeps(context.extensionPath);
+      spawnPython(context.extensionPath, output);
+      const retry = await ensureBackendAlive(context, output);
+      if (!retry) {
+        void vscode.window.showErrorMessage(
+          `CodeWhisper: Python backend failed to start. See Output → CodeWhisper. Try: ${pipInstallCommand(context.extensionPath)}`
+        );
+        return;
+      }
+    }
 
     if (voicePanel) {
       voicePanel.reveal(vscode.ViewColumn.Beside);
@@ -142,51 +359,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.ViewColumn.Beside,
         { enableScripts: true, retainContextWhenHidden: true }
       );
-      voicePanel.onDidDispose(() => { voicePanel = undefined; });
+      voicePanel.onDidDispose(() => {
+        voicePanel = undefined;
+      });
+      attachVoicePanelHandlers(voicePanel);
     }
 
     voicePanel.webview.html = getVoiceHtml();
-    status.text = "🎙 listening";
-
-    voicePanel.webview.onDidReceiveMessage(async (msg: { type: string; text?: string; message?: string }) => {
-      if (msg.type === "error") {
-        status.text = "● ready";
-        void vscode.window.showWarningMessage(`CodeWhisper mic error: ${msg.message}`);
-        return;
-      }
-      if (msg.type !== "transcript" || !msg.text) return;
-
-      status.text = "⏳ thinking";
-      void voicePanel?.webview.postMessage({ type: "thinking" });
-
-      const response = await sendToPython({
-        type: "ask",
-        transcript: msg.text,
-        code,
-        filename,
-        groq_api_key: groqKey,
-        elevenlabs_api_key: elKey,
-        voice_id: voiceId,
-      });
-
-      if (response.type === "error") {
-        status.text = "● ready";
-        void voicePanel?.webview.postMessage({ type: "error", message: response.message });
-        void vscode.window.showErrorMessage(`CodeWhisper: ${String(response.message)}`);
-        return;
-      }
-
-      status.text = "🔊 speaking";
-      void voicePanel?.webview.postMessage({ type: "play", data: response.audio_b64 });
-
-      // Reset status after ~10s (audio length unknown without decoding)
-      setTimeout(() => { status.text = "● ready"; }, 10000);
-    });
+    status.text = "$(mic) listening";
   });
 
-  context.subscriptions.push(voiceAsk, { dispose: () => voicePanel?.dispose() });
+  const installDeps = vscode.commands.registerCommand("codewhisper.installPythonDeps", async () => {
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "CodeWhisper: pip install…" },
+        () => runPipInstallDeps(context.extensionPath)
+      );
+      disposePython();
+      spawnPython(context.extensionPath, output);
+      const ok = await ensureBackendAlive(context, output);
+      void vscode.window.showInformationMessage(
+        ok ? "CodeWhisper: Python dependencies OK." : "CodeWhisper: install finished but backend check failed. See Output."
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      void vscode.window.showErrorMessage(`CodeWhisper: ${msg}`);
+    }
+  });
+
+  context.subscriptions.push(voiceAsk, installDeps, { dispose: () => voicePanel?.dispose() });
 }
 
 export function deactivate(): void {
+  suppressPythonExitLog = true;
+  rl?.close();
+  rl = undefined;
+  pyProc?.removeAllListeners();
   pyProc?.kill();
+  pyProc = undefined;
 }

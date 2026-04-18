@@ -1,13 +1,23 @@
 {
   "name": "codewhisper",
   "displayName": "CodeWhisper",
-  "description": "Voice-first coding buddy powered by Groq + ElevenLabs.",
-  "version": "0.2.0",
-  "publisher": "codewhisper",
+  "description": "Voice Ask for your editor: speak a question, send context from the file to Groq, hear the answer with ElevenLabs.",
+  "version": "1.0.0",
+  "publisher": "codewhisperer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pulkitgovrani/codewhisper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pulkitgovrani/codewhisper/issues"
+  },
+  "homepage": "https://github.com/pulkitgovrani/codewhisper#readme",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": ["Other"],
+  "keywords": ["voice", "groq", "elevenlabs", "speech", "ai", "assistant"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
@@ -15,6 +25,10 @@
       {
         "command": "codewhisper.voiceAsk",
         "title": "CodeWhisper: Voice Ask"
+      },
+      {
+        "command": "codewhisper.installPythonDeps",
+        "title": "CodeWhisper: Install Python Dependencies"
       }
     ],
     "keybindings": [
@@ -28,20 +42,25 @@
     "configuration": {
       "title": "CodeWhisper",
       "properties": {
+        "codewhisper.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Python executable (empty = python on Windows, python3 elsewhere)."
+        },
         "codewhisper.groqApiKey": {
           "type": "string",
           "default": "",
-          "description": "Groq API key."
+          "description": "Groq API key (console.groq.com)."
         },
         "codewhisper.elevenLabsApiKey": {
           "type": "string",
           "default": "",
-          "description": "ElevenLabs API key."
+          "description": "ElevenLabs API key (xi-api-key)."
         },
         "codewhisper.elevenLabsVoiceId": {
           "type": "string",
           "default": "",
-          "description": "ElevenLabs voice ID."
+          "description": "ElevenLabs voice ID from the voice library."
         }
       }
     }

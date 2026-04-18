@@ -4,3 +4,6 @@ src/**
 .gitignore
 **/tsconfig.json
 **/*.map
+.venv/**
+**/__pycache__/**
+node_modules/**

@@ -7,6 +7,9 @@ import elevenlabs_client
 
 
 def handle(msg: dict) -> dict:
+    if msg.get("type") == "ping":
+        return {"type": "pong"}
+
     if msg.get("type") != "ask":
         return {"type": "error", "message": f"Unknown message type: {msg.get('type')}"}
 
