@@ -3,6 +3,7 @@ import * as cp from "child_process";
 import * as path from "path";
 import * as readline from "readline";
 import { promisify } from "util";
+import { buildEditorContext, type ContextMode } from "./context";
 
 const execFileAsync = promisify(cp.execFile);
 
@@ -13,28 +14,6 @@ let suppressPythonExitLog = false;
 let stderrBuf = "";
 
 const PYTHON_TIMEOUT_MS = 120_000;
-
-function speechMicErrorHint(code: string | undefined): string {
-  const c = (code ?? "").toLowerCase();
-  if (c === "not-allowed" || c === "service-not-allowed") {
-    if (process.platform === "darwin") {
-      return (
-        "Microphone blocked (not-allowed). On macOS: System Settings → Privacy & Security → Microphone → " +
-        "turn ON for Visual Studio Code or Cursor. Then Developer: Reload Window and open Voice Ask again."
-      );
-    }
-    if (process.platform === "win32") {
-      return (
-        "Microphone blocked (not-allowed). Windows: Settings → Privacy & security → Microphone → allow access, " +
-        "and allow VS Code. Then reload the window and try again."
-      );
-    }
-    return (
-      "Microphone blocked (not-allowed). Allow the microphone for this app in your OS privacy settings, reload the window, and try again."
-    );
-  }
-  return `Speech recognition: ${code ?? "unknown error"}`;
-}
 
 /** Trim secrets so pasted keys with newlines/spaces still work. */
 function trimSecret(value: string | undefined): string {
@@ -146,19 +125,143 @@ async function ensureBackendAlive(context: vscode.ExtensionContext, output: vsco
   return pong.type === "pong";
 }
 
-function getEditorContext(): { code: string; filename: string } {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) return { code: "", filename: "" };
-  const selection = editor.selection;
-  const code = selection.isEmpty ? editor.document.getText() : editor.document.getText(selection);
-  return { code, filename: editor.document.fileName };
+function readContextMode(cfg: vscode.WorkspaceConfiguration): ContextMode {
+  const v = cfg.get<string>("contextMode");
+  if (v === "fullFile" || v === "selection" || v === "visibleRange" || v === "selectionSurrounding") {
+    return v;
+  }
+  return "selectionSurrounding";
 }
 
-function showResultPanel(context: vscode.ExtensionContext, transcript: string, answer: string, audioB64: string): void {
+function micPanelHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';"/>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: var(--vscode-font-family); font-size: 14px; color: var(--vscode-foreground);
+           background: var(--vscode-editor-background);
+           display: flex; flex-direction: column; align-items: center;
+           justify-content: center; min-height: 100vh; gap: 16px; padding: 24px; }
+    #btn { font-size: 56px; background: none; border: none; cursor: pointer; user-select: none; line-height: 1; }
+    #btn:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: 4px; }
+    #status { opacity: 0.85; text-align: center; max-width: 280px; }
+  </style>
+</head>
+<body>
+  <button id="btn" type="button" aria-label="Tap to record">🐙</button>
+  <div id="status">Tap the octopus to speak, tap again to stop</div>
+  <script>
+    const vscode = acquireVsCodeApi();
+    const btn = document.getElementById('btn');
+    const status = document.getElementById('status');
+    let recorder, chunks = [], recording = false;
+
+    btn.addEventListener('click', async () => {
+      if (recording) { recorder.stop(); return; }
+      let stream;
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+      catch (e) {
+        const code = e && e.name ? e.name : 'unknown';
+        status.textContent = 'Mic error: ' + (e && e.message ? e.message : String(e));
+        vscode.postMessage({ type: 'error', code: code, message: status.textContent });
+        return;
+      }
+
+      chunks = [];
+      recorder = new MediaRecorder(stream);
+      recording = true;
+      btn.textContent = '⏺';
+      status.textContent = 'Recording… tap again to stop';
+
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        recording = false;
+        btn.textContent = '⏳';
+        status.textContent = 'Sending…';
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const buf = await blob.arrayBuffer();
+        const u8 = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < u8.byteLength; i++) {
+          binary += String.fromCharCode(u8[i]);
+        }
+        const b64 = btoa(binary);
+        vscode.postMessage({ type: 'audio', audio_b64: b64 });
+        btn.textContent = '🐙';
+        status.textContent = 'Done.';
+      };
+      recorder.start();
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function recordAudioInWebview(context: vscode.ExtensionContext): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const panel = vscode.window.createWebviewPanel(
+      "codewhisperMic",
+      "CodeWhisper — speak",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, retainContextWhenHidden: false }
+    );
+
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+
+    panel.webview.html = micPanelHtml();
+
+    const sub = panel.webview.onDidReceiveMessage(
+      (msg: { type?: string; audio_b64?: string; message?: string; code?: string }) => {
+        if (msg.type === "audio" && msg.audio_b64) {
+          finish(() => {
+            sub.dispose();
+            panel.dispose();
+            resolve(msg.audio_b64!);
+          });
+        } else if (msg.type === "error") {
+          finish(() => {
+            sub.dispose();
+            panel.dispose();
+            reject(new Error(msg.message ?? "Microphone error"));
+          });
+        }
+      }
+    );
+
+    panel.onDidDispose(
+      () => {
+        sub.dispose();
+        finish(() => {
+          reject(new Error("Recording cancelled."));
+        });
+      },
+      null,
+      context.subscriptions
+    );
+  });
+}
+
+function showResultPanel(
+  context: vscode.ExtensionContext,
+  transcript: string,
+  answer: string,
+  audioB64: string,
+  onDispose: () => void
+): void {
   const panel = vscode.window.createWebviewPanel(
     "codewhisperAudio", "CodeWhisper", vscode.ViewColumn.Beside,
     { enableScripts: true, retainContextWhenHidden: false }
   );
+  panel.onDidDispose(onDispose, null, context.subscriptions);
   const esc = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   panel.webview.html = `<!DOCTYPE html><html><head>
     <meta charset="UTF-8"/>
@@ -180,7 +283,6 @@ function showResultPanel(context: vscode.ExtensionContext, transcript: string, a
     p.src = 'data:audio/mpeg;base64,${audioB64}';
     p.play().catch(e => console.error('autoplay failed:', e));
     </script></body></html>`;
-  void context;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -189,9 +291,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   spawnPython(context.extensionPath, output);
 
+  const highlightDeco = vscode.window.createTextEditorDecorationType({
+    backgroundColor: new vscode.ThemeColor("editor.wordHighlightBackground"),
+    border: "1px solid var(--vscode-editorGroupHeader-tabsBorder)",
+  });
+  context.subscriptions.push(highlightDeco);
+
+  let lastHighlight: { uri: vscode.Uri; range: vscode.Range } | null = null;
+
+  function clearContextHighlight(): void {
+    if (lastHighlight) {
+      const ed = vscode.window.visibleTextEditors.find(
+        (e) => e.document.uri.toString() === lastHighlight!.uri.toString()
+      );
+      ed?.setDecorations(highlightDeco, []);
+      lastHighlight = null;
+    }
+  }
+
+  function applyContextHighlight(uri: vscode.Uri, range: vscode.Range | null): void {
+    clearContextHighlight();
+    if (!range) return;
+    lastHighlight = { uri, range };
+    const ed = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
+    ed?.setDecorations(highlightDeco, [range]);
+  }
+
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  status.text = "● ready";
-  status.tooltip = "CodeWhisper — Cmd+Shift+Space";
+  status.text = "$(mic) 🐙 CodeWhisper";
+  status.tooltip = "CodeWhisper — Voice Ask (Cmd+Shift+Space). Opens the in-editor recorder.";
   status.command = "codewhisper.voiceAsk";
   status.show();
   context.subscriptions.push(status);
@@ -201,6 +329,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const groqKey = trimSecret(cfg.get<string>("groqApiKey"));
     const elKey = trimSecret(cfg.get<string>("elevenLabsApiKey"));
     const voiceId = trimSecret(cfg.get<string>("elevenLabsVoiceId"));
+    const maxContextChars = Math.max(500, cfg.get<number>("maxContextChars") ?? 8000);
+    const surroundLines = Math.max(0, cfg.get<number>("contextSurroundLines") ?? 20);
+    const contextMode = readContextMode(cfg);
 
     if (!groqKey || !elKey || !voiceId) {
       void vscode.window.showErrorMessage("CodeWhisper: set groqApiKey, elevenLabsApiKey, elevenLabsVoiceId in settings.");
@@ -213,30 +344,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
 
-    const { code, filename } = getEditorContext();
+    const editor = vscode.window.activeTextEditor;
+    const built = buildEditorContext(editor, contextMode, surroundLines, maxContextChars);
+    const docUri = editor?.document.uri;
 
-    status.text = "🎙 listening";
+    clearContextHighlight();
 
-    // Python opens browser, records audio, does STT+LLM+TTS, returns audio
+    let audioB64: string;
+    status.text = "$(mic) 🎙 listening…";
+    try {
+      audioB64 = await recordAudioInWebview(context);
+    } catch (e) {
+      status.text = "$(mic) 🐙 CodeWhisper";
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg !== "Recording cancelled.") {
+        void vscode.window.showErrorMessage(`CodeWhisper: ${msg}`);
+      }
+      return;
+    }
+
+    status.text = "$(sync~spin) thinking…";
+
     const response = await sendToPython(
-      { type: "voice_ask", code, filename, groq_api_key: groqKey, elevenlabs_api_key: elKey, voice_id: voiceId },
+      {
+        type: "voice_ask",
+        audio_b64: audioB64,
+        context_body: built.contextBody,
+        max_context_chars: maxContextChars,
+        groq_api_key: groqKey,
+        elevenlabs_api_key: elKey,
+        voice_id: voiceId,
+      },
       PYTHON_TIMEOUT_MS
     );
 
     if (response.type === "error") {
-      status.text = "● ready";
+      status.text = "$(mic) 🐙 CodeWhisper";
       void vscode.window.showErrorMessage(`CodeWhisper: ${String(response.message)}`);
       output.appendLine(`[error] ${String(response.message)}`);
       output.show(true);
       return;
     }
 
-    status.text = "🔊 speaking";
+    status.text = "$(unmute) 🔊 speaking…";
     output.appendLine(`[transcript] ${String(response.transcript ?? "")}`);
     output.appendLine(`[answer] ${String(response.text ?? "")}`);
     output.appendLine(`[audio_b64 length] ${String(response.audio_b64 ?? "").length}`);
-    showResultPanel(context, String(response.transcript ?? ""), String(response.text ?? ""), String(response.audio_b64));
-    setTimeout(() => { status.text = "● ready"; }, 15000);
+
+    if (docUri && built.highlightRange) {
+      applyContextHighlight(docUri, built.highlightRange);
+    }
+
+    showResultPanel(
+      context,
+      String(response.transcript ?? ""),
+      String(response.text ?? ""),
+      String(response.audio_b64 ?? ""),
+      () => clearContextHighlight()
+    );
+
+    setTimeout(() => { status.text = "$(mic) 🐙 CodeWhisper"; }, 15000);
   });
 
   const installDeps = vscode.commands.registerCommand("codewhisper.installPythonDeps", async () => {

@@ -1,7 +1,7 @@
 import sys
 import json
 import base64
-import subprocess
+import webbrowser
 
 import groq_client
 import elevenlabs_client
@@ -9,11 +9,8 @@ import mic_server
 
 
 def open_browser(url: str) -> None:
-    subprocess.Popen(
-        ["open", url],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    """Open URL in the system browser (fallback when no audio is supplied)."""
+    webbrowser.open(url)
 
 
 def handle(msg: dict) -> dict:
@@ -32,19 +29,26 @@ def handle(msg: dict) -> dict:
         groq_api_key = str(msg.get("groq_api_key", "")).strip()
         el_api_key = str(msg.get("elevenlabs_api_key", "")).strip()
         voice_id = str(msg.get("voice_id", "")).strip()
-        code = str(msg.get("code", ""))
-        filename = str(msg.get("filename", ""))
+        context_body = str(msg.get("context_body", ""))
+        max_context_chars = int(msg.get("max_context_chars", 8000) or 8000)
+        audio_b64_in = msg.get("audio_b64")
 
         if not groq_api_key:
             return {"type": "error", "message": "groqApiKey is not set."}
         if not el_api_key or not voice_id:
             return {"type": "error", "message": "elevenLabsApiKey or elevenLabsVoiceId is not set."}
 
-        # 1. Capture mic audio via browser
-        try:
-            audio_bytes = mic_server.capture_audio_via_browser(open_browser)
-        except TimeoutError:
-            return {"type": "error", "message": "No audio received (timed out)."}
+        # 1. Mic audio: from extension webview (preferred) or legacy browser capture
+        if audio_b64_in:
+            try:
+                audio_bytes = base64.b64decode(str(audio_b64_in))
+            except Exception as e:
+                return {"type": "error", "message": f"Invalid audio_b64: {e}"}
+        else:
+            try:
+                audio_bytes = mic_server.capture_audio_via_browser(open_browser)
+            except TimeoutError:
+                return {"type": "error", "message": "No audio received (timed out)."}
 
         # 2. STT
         transcript = elevenlabs_client.transcribe(audio_bytes, el_api_key)
@@ -52,7 +56,7 @@ def handle(msg: dict) -> dict:
             return {"type": "error", "message": "No speech detected."}
 
         # 3. LLM
-        text = groq_client.ask(transcript, code, filename, groq_api_key)
+        text = groq_client.ask(transcript, context_body, groq_api_key, max_context_chars)
 
         # 4. TTS
         audio_out = elevenlabs_client.synthesize(text, el_api_key, voice_id)
@@ -61,17 +65,17 @@ def handle(msg: dict) -> dict:
         return {"type": "response", "transcript": transcript, "text": text, "audio_b64": audio_b64}
 
     if msg.get("type") == "ask":
-        transcript = msg.get("transcript", "")
-        code = msg.get("code", "")
-        filename = msg.get("filename", "")
-        groq_api_key = msg.get("groq_api_key", "")
-        el_api_key = msg.get("elevenlabs_api_key", "")
-        voice_id = msg.get("voice_id", "")
+        transcript = str(msg.get("transcript", ""))
+        context_body = str(msg.get("context_body", ""))
+        max_context_chars = int(msg.get("max_context_chars", 8000) or 8000)
+        groq_api_key = str(msg.get("groq_api_key", "")).strip()
+        el_api_key = str(msg.get("elevenlabs_api_key", "")).strip()
+        voice_id = str(msg.get("voice_id", "")).strip()
 
         if not groq_api_key:
             return {"type": "error", "message": "groqApiKey is not set."}
 
-        text = groq_client.ask(transcript, code, filename, groq_api_key)
+        text = groq_client.ask(transcript, context_body, groq_api_key, max_context_chars)
 
         if not el_api_key or not voice_id:
             return {"type": "error", "message": "elevenLabsApiKey or elevenLabsVoiceId is not set."}

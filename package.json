@@ -2,7 +2,7 @@
   "name": "codewhisper-voice",
   "displayName": "CodeWhisper",
   "description": "Voice Ask for your editor: speak a question, send context from the file to Groq, hear the answer with ElevenLabs.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "codewhisperer",
   "repository": {
     "type": "git",
@@ -61,6 +61,26 @@
           "type": "string",
           "default": "",
           "description": "ElevenLabs voice ID from the voice library."
+        },
+        "codewhisper.contextMode": {
+          "type": "string",
+          "enum": ["fullFile", "selection", "visibleRange", "selectionSurrounding"],
+          "default": "selectionSurrounding",
+          "description": "What code to include: full file; selection (or full file if empty); visible viewport; or selection with surrounding lines."
+        },
+        "codewhisper.contextSurroundLines": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 500,
+          "description": "Extra lines above/below the selection when context mode is selectionSurrounding."
+        },
+        "codewhisper.maxContextChars": {
+          "type": "number",
+          "default": 8000,
+          "minimum": 500,
+          "maximum": 50000,
+          "description": "Maximum characters of formatted code context sent to Groq."
         }
       }
     }

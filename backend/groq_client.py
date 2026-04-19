@@ -7,11 +7,19 @@ SYSTEM_PROMPT = (
 )
 
 
-def ask(transcript: str, code: str, filename: str, api_key: str) -> str:
-    user_msg = transcript
-    if code.strip():
-        label = filename or "current file"
-        user_msg += f"\n\nCode context ({label}):\n{code[:8000]}"
+def ask(transcript: str, context_body: str, api_key: str, max_chars: int = 8000) -> str:
+    """Build user message from spoken question plus optional formatted code context."""
+    parts: list[str] = []
+    t = (transcript or "").strip()
+    if t:
+        parts.append(t)
+    cb = (context_body or "").strip()
+    if cb:
+        tb = cb[:max_chars]
+        if len(cb) > max_chars:
+            tb += "\n[... truncated ...]"
+        parts.append(tb)
+    user_msg = "\n\n".join(parts) if parts else ""
 
     resp = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
